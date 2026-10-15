@@ -1,0 +1,60 @@
+// scripts/deploy.js
+// Usage: npx hardhat run scripts/deploy.js --network baseSepolia
+const hre = require("hardhat");
+
+// ---- Constructor args: edit these ----
+const NAME = "My Token";
+const SYMBOL = "MTK";
+const INITIAL_SUPPLY = 1_000_000; // whole tokens (scaled by 18 decimals in the contract)
+// --------------------------------------
+
+async function main() {
+  const { ethers, network } = hre;
+  const [deployer] = await ethers.getSigners();
+
+  console.log("Network:  ", network.name);
+  console.log("Deployer: ", deployer.address);
+
+  const balance = await ethers.provider.getBalance(deployer.address);
+  console.log("Balance:  ", ethers.formatEther(balance), "ETH");
+  if (balance === 0n) {
+    throw new Error("Deployer has no Base Sepolia ETH. Get some from a faucet first.");
+  }
+
+  const args = [NAME, SYMBOL, INITIAL_SUPPLY];
+
+  const Token = await ethers.getContractFactory("Token");
+  const token = await Token.deploy(...args);
+  await token.waitForDeployment();
+
+  const address = await token.getAddress();
+  console.log("Token deployed to:", address);
+  console.log("Total supply:", ethers.formatUnits(await token.totalSupply(), 18));
+
+  // Wait a few blocks so Basescan has indexed the contract before verifying.
+  console.log("Waiting for 5 confirmations...");
+  await token.deploymentTransaction().wait(5);
+
+  try {
+    await hre.run("verify:verify", {
+      address,
+      constructorArguments: args,
+    });
+    console.log("Verified on Basescan.");
+  } catch (err) {
+    if (err.message.toLowerCase().includes("already verified")) {
+      console.log("Already verified.");
+    } else {
+      console.log("Verification failed. Run manually:");
+      console.log(
+        `npx hardhat verify --network baseSepolia ${address} "${NAME}" "${SYMBOL}" ${INITIAL_SUPPLY}`
+      );
+      console.log("Error:", err.message);
+    }
+  }
+}
+
+main().catch((err) => {
+  console.error(err);
+  process.exitCode = 1;
+});
