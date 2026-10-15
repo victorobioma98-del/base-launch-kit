@@ -1,0 +1,114 @@
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.20;
+
+import {IERC20} from "@openzeppelin/contracts/token/ERC20/IERC20.sol";
+import {SafeERC20} from "@openzeppelin/contracts/token/ERC20/utils/SafeERC20.sol";
+import {ReentrancyGuard} from "@openzeppelin/contracts/utils/ReentrancyGuard.sol";
+
+/// @title LPLocker
+/// @notice Locks Uniswap V2 LP tokens (or any ERC20) until a timestamp.
+///         Only the lock's owner can withdraw, and only after the unlock time.
+///         There is no admin, no emergency withdraw, and no way to shorten a lock.
+contract LPLocker is ReentrancyGuard {
+    using SafeERC20 for IERC20;
+
+    struct Lock {
+        address owner;      // who can withdraw
+        address token;      // LP token address
+        uint256 amount;     // amount locked
+        uint64 lockedAt;    // timestamp the lock was created
+        uint64 unlockTime;  // timestamp after which owner can withdraw
+        bool withdrawn;
+    }
+
+    uint256 public nextLockId;
+    mapping(uint256 => Lock) public locks;
+    mapping(address => uint256[]) private _locksByOwner;
+
+    event Locked(
+        uint256 indexed lockId,
+        address indexed owner,
+        address indexed token,
+        uint256 amount,
+        uint64 unlockTime
+    );
+    event LockExtended(uint256 indexed lockId, uint64 oldUnlockTime, uint64 newUnlockTime);
+    event Withdrawn(uint256 indexed lockId, address indexed owner, address indexed token, uint256 amount);
+
+    error ZeroAddress();
+    error ZeroAmount();
+    error UnlockTimeInPast();
+    error NotLockOwner();
+    error StillLocked();
+    error AlreadyWithdrawn();
+    error NewTimeNotLater();
+
+    /// @notice Lock LP tokens. Caller must approve this contract first.
+    /// @param token LP token address
+    /// @param amount Amount to lock
+    /// @param unlockTime Unix timestamp when the lock expires
+    /// @return lockId Id of the new lock
+    function lock(address token, uint256 amount, uint64 unlockTime)
+        external
+        nonReentrant
+        returns (uint256 lockId)
+    {
+        if (token == address(0)) revert ZeroAddress();
+        if (amount == 0) revert ZeroAmount();
+        if (unlockTime <= block.timestamp) revert UnlockTimeInPast();
+
+        // Measure the actual amount received (handles fee-on-transfer tokens).
+        uint256 balBefore = IERC20(token).balanceOf(address(this));
+        IERC20(token).safeTransferFrom(msg.sender, address(this), amount);
+        uint256 received = IERC20(token).balanceOf(address(this)) - balBefore;
+        if (received == 0) revert ZeroAmount();
+
+        lockId = nextLockId++;
+        locks[lockId] = Lock({
+            owner: msg.sender,
+            token: token,
+            amount: received,
+            lockedAt: uint64(block.timestamp),
+            unlockTime: unlockTime,
+            withdrawn: false
+        });
+        _locksByOwner[msg.sender].push(lockId);
+
+        emit Locked(lockId, msg.sender, token, received, unlockTime);
+    }
+
+    /// @notice Extend a lock. The unlock time can only be moved later.
+    function extendLock(uint256 lockId, uint64 newUnlockTime) external {
+        Lock storage l = locks[lockId];
+        if (l.owner != msg.sender) revert NotLockOwner();
+        if (l.withdrawn) revert AlreadyWithdrawn();
+        if (newUnlockTime <= l.unlockTime) revert NewTimeNotLater();
+
+        uint64 old = l.unlockTime;
+        l.unlockTime = newUnlockTime;
+        emit LockExtended(lockId, old, newUnlockTime);
+    }
+
+    /// @notice Withdraw the full locked amount after the unlock time.
+    function withdraw(uint256 lockId) external nonReentrant {
+        Lock storage l = locks[lockId];
+        if (l.owner != msg.sender) revert NotLockOwner();
+        if (l.withdrawn) revert AlreadyWithdrawn();
+        if (block.timestamp < l.unlockTime) revert StillLocked();
+
+        l.withdrawn = true;
+        uint256 amount = l.amount;
+        IERC20(l.token).safeTransfer(msg.sender, amount);
+
+        emit Withdrawn(lockId, msg.sender, l.token, amount);
+    }
+
+    /// @notice All lock ids created by an owner (includes withdrawn locks).
+    function getLockIdsByOwner(address owner_) external view returns (uint256[] memory) {
+        return _locksByOwner[owner_];
+    }
+
+    /// @notice Convenience view for a single lock.
+    function getLock(uint256 lockId) external view returns (Lock memory) {
+        return locks[lockId];
+    }
